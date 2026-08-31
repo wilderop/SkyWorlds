@@ -1,0 +1,17 @@
+name: SkyWorlds
+version: 2.1.1
+main: com.example.skyworlds.SkyWorlds
+api-version: 1.21
+author: wilder0p
+description: Mirror dimension system. Main world uses vanilla portals, mirror world uses plugin.
+website: https://github.com/wilderop/SkyWorlds
+
+commands: {}
+
+permissions:
+  skyworlds.use:
+    description: Allows using the mirror dimension system
+    default: true
+  skyworlds.bypass:
+    description: Bypasses Dragon's Breath requirement
+    default: op
