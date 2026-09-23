@@ -1,0 +1,14 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.example.skyworlds.fabric.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "mixins": [
+    "DistanceManagerMixin",
+    "PersistentEntitySectionManagerMixin",
+    "ThrownEnderpearlMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
