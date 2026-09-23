@@ -1,16 +1,16 @@
 name: SkyWorlds
-version: 2.2.4
+version: 3.0.18
 main: com.example.skyworlds.SkyWorlds
 api-version: 1.21
-author: wilder0p
-description: Mirror dimension system with Dragon's Breath requirement. Main world uses vanilla portals, mirror world uses plugin.
+author: SkyWorlds Team
+description: Fly-up gate from Paper survival into the Fabric sky world.
 website: https://github.com/wilderop/SkyWorlds
 
 commands: {}
 
 permissions:
   skyworlds.use:
-    description: Allows using the mirror dimension system
+    description: Allows using the sky gate
     default: true
   skyworlds.bypass:
     description: Bypasses Dragon's Breath requirement

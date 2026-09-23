@@ -1,30 +1,20 @@
-# SkyWorlds Plugin Configuration
-# Configuration for the mirror dimension system
+# SkyWorlds 3.0 — Paper ground overworld. Fly-up sends players to Fabric.
 
-# Y-level where the dimension switch starts to trigger
 threshold_y: 1320
-
-# Y-level used as the mirror pivot point
 pivot_y: 1321
-
-# Number of ticks a player must stay above threshold_y before switching
-# 20 ticks = 1 second, so 60 ticks = 3 seconds
 transition_ticks: 60
-
-# Cooldown period (in ticks) after switching before another switch can occur
-cooldown_ticks: 100
-
-# Duration (in ticks) of the darkness/fade effect when switching dimensions
+cooldown_ticks: 200
 fade_ticks: 50
 
-# Coordinate scale ratio between Overworld and Nether
-nether_scale: 8.0
+# Same-host JSON drop between Paper and Fabric.
+handoff-dir: /mnt/pool/skygate
 
-# Radius (in blocks) to search for existing nether portals
-portal_search_radius: 32
-
-# Seed for the mirror overworld dimension. 0 generates a new seed at first run.
-mirror_overworld_seed: 0
-
-# Seed for the mirror nether dimension. 0 generates a new seed at first run.
-mirror_nether_seed: 0
+redis:
+  host: 127.0.0.1
+  port: 6379
+  password-file: ""
+  sentinel-master: azpbmd
+  sentinels:
+    - 127.0.0.1:26379
+    - 127.0.0.1:26379
+    - 127.0.0.1:26379
