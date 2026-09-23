@@ -1,96 +1,150 @@
 package com.example.skyworlds;
 
-import org.bukkit.Axis;
+import com.google.common.io.ByteArrayDataOutput;
+import com.google.common.io.ByteStreams;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import org.bukkit.ChatColor;
-import org.bukkit.Chunk;
 import org.bukkit.Location;
 import org.bukkit.Material;
+import org.bukkit.NamespacedKey;
 import org.bukkit.World;
-import org.bukkit.WorldCreator;
-import org.bukkit.WorldType;
-import org.bukkit.block.Block;
-import org.bukkit.block.data.Orientable;
+import org.bukkit.entity.EnderPearl;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
-import org.bukkit.event.entity.EntityPortalEvent;
+import org.bukkit.event.entity.ProjectileHitEvent;
+import org.bukkit.event.entity.ProjectileLaunchEvent;
+import org.bukkit.event.player.PlayerBedEnterEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerPortalEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerRespawnEvent;
+import org.bukkit.event.player.PlayerTeleportEvent.TeleportCause;
+import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
+import org.bukkit.projectiles.ProjectileSource;
 import org.bukkit.scheduler.BukkitRunnable;
-import org.bukkit.event.player.PlayerTeleportEvent.TeleportCause;
-import org.bukkit.WorldBorder;
+import org.bukkit.util.Vector;
 
-import java.util.*;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
 import java.util.logging.Level;
 
 /**
- * SkyWorlds Plugin - Mirror Dimension System
- * 
- * Creates mirror dimensions that players can access by flying above a threshold
- * with Dragon's Breath. Includes optimized portal linking between dimensions.
- * 
- * v2.1.1: CRITICAL FIX - Plugin now only handles mirror world portals
- *         Main world uses vanilla Minecraft portal behavior
- * 
- * @author SkyWorlds Team
- * @version 2.1.1 (Main World Isolation Fix)
+ * SkyWorlds 3.0 — Paper ground overworld. Fly-up (dragon's breath) sends the
+ * player to the Fabric sky server via Velocity. Local mirror worlds are not used.
  */
 public class SkyWorlds extends JavaPlugin implements Listener {
+    public static final String CHANNEL = "skygate:connect";
 
-    // World references
     private World mainOverworld;
-    private World mirrorOverworld;
     private World mainNether;
-    private World mirrorNether;
     private World theEnd;
 
-    // Configuration values
     private int thresholdY;
     private int pivotY;
     private int transitionTicks;
     private int cooldownTicks;
     private int fadeTicks;
-    private int portalSearchRadius;
-    private double netherScale;
 
-    // Player tracking for dimension transitions
     private final Map<UUID, Integer> ticksAboveThreshold = new HashMap<>();
     private final Map<UUID, Integer> switchCooldowns = new HashMap<>();
 
+    private HandoffStore store;
+    private RedisBus redis;
+    private NamespacedKey pearlTag;
+    private CombinedSleep combinedSleep;
+    private StasisKeepalive stasisKeepalive;
+
     @Override
     public void onEnable() {
-        try {
-            saveDefaultConfig();
-            loadConfigurationValues();
-            
-            if (!initializeWorlds()) {
-                getLogger().severe("Failed to initialize worlds. Disabling plugin.");
-                getServer().getPluginManager().disablePlugin(this);
-                return;
-            }
+        saveDefaultConfig();
+        loadConfigurationValues();
+        pearlTag = new NamespacedKey(this, "transferred");
 
-            getServer().getPluginManager().registerEvents(this, this);
+        Path handoff = Path.of(getConfig().getString("handoff-dir", "/mnt/pool/skygate"));
+        store = new HandoffStore(handoff, getLogger());
 
-            startWorldSyncTask();
-            startDimensionTransitionTask();
-
-            getLogger().info("========================================");
-            getLogger().info("SkyWorlds v2.1.1 enabled successfully!");
-            getLogger().info("Main world: Uses vanilla portal behavior");
-            getLogger().info("Mirror world: Uses plugin portal behavior");
-            getLogger().info("Threshold Y: " + thresholdY);
-            getLogger().info("Portal Search Radius: " + portalSearchRadius);
-            getLogger().info("Mirror Overworld: " + (mirrorOverworld != null ? "✓" : "✗"));
-            getLogger().info("Mirror Nether: " + (mirrorNether != null ? "✓" : "✗"));
-            getLogger().info("========================================");
-
-        } catch (Exception e) {
-            getLogger().log(Level.SEVERE, "Critical error during plugin initialization", e);
-            getServer().getPluginManager().disablePlugin(this);
+        String host = getConfig().getString("redis.host", "127.0.0.1");
+        int port = getConfig().getInt("redis.port", 6379);
+        Path passFile = Path.of(getConfig().getString("redis.password-file", "redis.pass"));
+        String sentinelMaster = getConfig().getString("redis.sentinel-master", "azpbmd");
+        List<String> sentinels = getConfig().getStringList("redis.sentinels");
+        if (sentinels == null || sentinels.isEmpty()) {
+            sentinels = List.of("127.0.0.1:26379", "127.0.0.1:26379", "127.0.0.1:26379");
         }
+        redis = new RedisBus(getLogger(), host, port, passFile, sentinelMaster, sentinels);
+        if (!redis.connect()) {
+            getLogger().severe("SkyGate Redis is required for Velocity. Disabling.");
+            getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
+
+        mainOverworld = getServer().getWorld("world");
+        mainNether = getServer().getWorld("world_nether");
+        theEnd = getServer().getWorld("world_the_end");
+        if (mainOverworld == null) {
+            getLogger().severe("Overworld (world) not found.");
+            getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
+
+        getServer().getMessenger().registerOutgoingPluginChannel(this, "BungeeCord");
+        getServer().getPluginManager().registerEvents(this, this);
+        combinedSleep = new CombinedSleep(this, store);
+        getServer().getPluginManager().registerEvents(combinedSleep, this);
+        disableVanillaSleepSkip();
+        startDimensionTransitionTask();
+        startIncomingTask();
+        startClockPublishTask();
+        int leftoverSky = LegacyMirrorResume.scanAndQueue(this, store, redis, mainOverworld);
+        if (leftoverSky > 0) {
+            getLogger().info("Queued " + leftoverSky + " leftover sky-world logouts to Fabric");
+        }
+        getServer().getScheduler().runTask(this, () -> {
+            getServer().dispatchCommand(getServer().getConsoleSender(),
+                    "time of minecraft:overworld resume");
+            clearPersonalClocks();
+            unloadLegacyMirrors();
+        });
+
+        stasisKeepalive = new StasisKeepalive(this, store, redis, pearlTag);
+        stasisKeepalive.start();
+
+        getLogger().info("SkyWorlds 3.0.18 enabled — fly-up uses Redis plus BungeeCord Connect.");
+    }
+
+    /**
+     * Keep playersSleepingPercentage at 100. 101 makes vanilla show
+     * "No amount of rest can pass this night" even though CombinedSleep
+     * still skips. Vanilla night skip is cancelled in CombinedSleep.
+     */
+    private void disableVanillaSleepSkip() {
+        getServer().dispatchCommand(getServer().getConsoleSender(),
+                "execute in minecraft:overworld run gamerule minecraft:players_sleeping_percentage 100");
+        getServer().dispatchCommand(getServer().getConsoleSender(),
+                "gamerule minecraft:locator_bar false");
+    }
+
+    @Override
+    public void onDisable() {
+        ticksAboveThreshold.clear();
+        switchCooldowns.clear();
+        getServer().getMessenger().unregisterOutgoingPluginChannel(this, "BungeeCord");
+        if (redis != null) {
+            redis.close();
+        }
+        getLogger().info("SkyWorlds 3.0 disabled.");
     }
 
     private void loadConfigurationValues() {
@@ -99,225 +153,209 @@ public class SkyWorlds extends JavaPlugin implements Listener {
         transitionTicks = getConfig().getInt("transition_ticks", 60);
         cooldownTicks = getConfig().getInt("cooldown_ticks", 100);
         fadeTicks = getConfig().getInt("fade_ticks", 50);
-        portalSearchRadius = getConfig().getInt("portal_search_radius", 32);
-        netherScale = getConfig().getDouble("nether_scale", 8.0);
-
-        if (portalSearchRadius > 64) {
-            getLogger().warning("portal_search_radius (" + portalSearchRadius + ") is very high! Recommend 32-48 for best balance.");
-        }
-        if (portalSearchRadius < 24 && netherScale >= 8.0) {
-            getLogger().warning("portal_search_radius (" + portalSearchRadius + ") may be too small for nether_scale " + netherScale + ". Recommend 32+ to prevent duplicate portals.");
-        }
-        if (thresholdY >= pivotY) {
-            getLogger().warning("threshold_y should be less than pivot_y for proper mirror behavior.");
-        }
     }
 
-    private boolean initializeWorlds() {
-        mainOverworld = getServer().getWorld("world");
-        if (mainOverworld == null) {
-            getLogger().severe("Main Overworld (world) not found!");
-            return false;
-        }
-
-        mainNether = getServer().getWorld("world_nether");
-        theEnd = getServer().getWorld("world_the_end");
-
-        if (mainNether == null) {
-            getLogger().warning("Main Nether not found. Nether features will be disabled.");
-        }
-        if (theEnd == null) {
-            getLogger().warning("The End not found. End will use vanilla behavior.");
-        }
-
-        mirrorOverworld = createMirrorWorld(
-            "mirror_overworld",
-            "mirror_overworld_seed",
-            World.Environment.NORMAL
-        );
-        
-        if (mirrorOverworld == null) {
-            getLogger().severe("Failed to create/load mirror_overworld!");
-            return false;
-        }
-
-        if (mainNether != null) {
-            mirrorNether = createMirrorWorld(
-                "mirror_nether",
-                "mirror_nether_seed",
-                World.Environment.NETHER
-            );
-            
-            if (mirrorNether == null) {
-                getLogger().warning("Failed to create/load mirror_nether. Nether mirroring disabled.");
-            }
-        }
-
-        syncWorldBorders();
-
-        return true;
-    }
-
-    private World createMirrorWorld(String worldName, String seedConfigKey, World.Environment environment) {
-        try {
-            long seed = getConfig().getLong(seedConfigKey, 0);
-            if (seed == 0) {
-                seed = new Random().nextLong();
-                getConfig().set(seedConfigKey, seed);
-                saveConfig();
-                getLogger().info("Generated new seed for " + worldName + ": " + seed);
-            }
-
-            WorldCreator creator = new WorldCreator(worldName)
-                    .environment(environment)
-                    .type(WorldType.NORMAL)
-                    .seed(seed);
-            
-            World world = creator.createWorld();
-            
-            if (world != null) {
-                getLogger().info("Successfully loaded " + worldName + " (seed: " + seed + ")");
-            }
-            
-            return world;
-            
-        } catch (Exception e) {
-            getLogger().log(Level.SEVERE, "Error creating mirror world: " + worldName, e);
-            return null;
-        }
-    }
-
-    private void copyWorldBorder(World source, World target) {
-        if (source == null || target == null) return;
-        
-        try {
-            WorldBorder sourceBorder = source.getWorldBorder();
-            WorldBorder targetBorder = target.getWorldBorder();
-            
-            targetBorder.setCenter(sourceBorder.getCenter());
-            targetBorder.setSize(sourceBorder.getSize());
-            targetBorder.setDamageAmount(sourceBorder.getDamageAmount());
-            targetBorder.setDamageBuffer(sourceBorder.getDamageBuffer());
-            targetBorder.setWarningDistance(sourceBorder.getWarningDistance());
-            targetBorder.setWarningTime(sourceBorder.getWarningTime());
-        } catch (Exception e) {
-            getLogger().log(Level.WARNING, "Error copying world border", e);
-        }
-    }
-
-    private void syncWorldBorders() {
-        copyWorldBorder(mainOverworld, mirrorOverworld);
-        if (mainNether != null && mirrorNether != null) {
-            copyWorldBorder(mainNether, mirrorNether);
-        }
-    }
-
-    private void clampToBorder(Location loc, World world) {
-        WorldBorder border = world.getWorldBorder();
-        Location center = border.getCenter();
-        double size = border.getSize();
-        double half = size / 2.0;
-        
-        double minX = center.getX() - half;
-        double maxX = center.getX() + half;
-        double minZ = center.getZ() - half;
-        double maxZ = center.getZ() + half;
-
-        double x = Math.max(minX, Math.min(loc.getX(), maxX));
-        double z = Math.max(minZ, Math.min(loc.getZ(), maxZ));
-
-        loc.setX(x);
-        loc.setZ(z);
-    }
-
-    private void startWorldSyncTask() {
+    private void startClockPublishTask() {
         new BukkitRunnable() {
             @Override
             public void run() {
-                try {
-                    if (mainOverworld != null && mirrorOverworld != null) {
-                        long mainFullTime = mainOverworld.getFullTime();
-                        long mirrorFullTime = mirrorOverworld.getFullTime();
-                        long syncedFullTime = Math.max(mainFullTime, mirrorFullTime);
-                        mainOverworld.setFullTime(syncedFullTime);
-                        mirrorOverworld.setFullTime(syncedFullTime);
-                        
-                        boolean syncedStorm = mainOverworld.hasStorm() && mirrorOverworld.hasStorm();
-                        boolean syncedThunder = mainOverworld.isThundering() && mirrorOverworld.isThundering();
-                        
-                        mainOverworld.setStorm(syncedStorm);
-                        mirrorOverworld.setStorm(syncedStorm);
-                        mainOverworld.setThundering(syncedThunder);
-                        mirrorOverworld.setThundering(syncedThunder);
-                        
-                        int syncedWeatherDur;
-                        if (syncedStorm) {
-                            syncedWeatherDur = Math.min(mainOverworld.getWeatherDuration(), mirrorOverworld.getWeatherDuration());
-                        } else {
-                            syncedWeatherDur = Math.max(mainOverworld.getWeatherDuration(), mirrorOverworld.getWeatherDuration());
-                        }
-                        
-                        int syncedThunderDur;
-                        if (syncedThunder) {
-                            syncedThunderDur = Math.min(mainOverworld.getThunderDuration(), mirrorOverworld.getThunderDuration());
-                        } else {
-                            syncedThunderDur = Math.max(mainOverworld.getThunderDuration(), mirrorOverworld.getThunderDuration());
-                        }
-                        
-                        mainOverworld.setWeatherDuration(syncedWeatherDur);
-                        mirrorOverworld.setWeatherDuration(syncedWeatherDur);
-                        mainOverworld.setThunderDuration(syncedThunderDur);
-                        mirrorOverworld.setThunderDuration(syncedThunderDur);
-                        
-                        copyWorldBorder(mainOverworld, mirrorOverworld);
-                    }
-                    
-                    if (mainNether != null && mirrorNether != null) {
-                        copyWorldBorder(mainNether, mirrorNether);
-                    }
-                } catch (Exception e) {
-                    getLogger().log(Level.WARNING, "Error in world sync task", e);
+                if (mainOverworld == null) return;
+                applyFabricClockSkip();
+                var border = mainOverworld.getWorldBorder();
+                store.writeClock(
+                        mainOverworld.getFullTime(),
+                        mainOverworld.hasStorm(),
+                        mainOverworld.isThundering(),
+                        mainOverworld.getWeatherDuration(),
+                        mainOverworld.getThunderDuration(),
+                        border.getSize(),
+                        border.getCenter().getX(),
+                        border.getCenter().getZ());
+                clearPersonalClocks();
+            }
+        }.runTaskTimer(this, 20L, 20L);
+    }
+
+    /** Fabric sleep skip jumps sky time; Paper is the published clock, so catch up. */
+    private void applyFabricClockSkip() {
+        JsonObject skip = store.takeClockSkip();
+        if (skip == null || !skip.has("fullTime")) {
+            return;
+        }
+        if (skip.has("created")) {
+            long age = System.currentTimeMillis() - skip.get("created").getAsLong();
+            if (age > 15_000L) {
+                return;
+            }
+        }
+        long fullTime = skip.get("fullTime").getAsLong();
+        if (combinedSleep != null) {
+            combinedSleep.runAsOurSkip(() -> mainOverworld.setFullTime(fullTime));
+        } else {
+            mainOverworld.setFullTime(fullTime);
+        }
+        if (!skip.has("clearWeather") || skip.get("clearWeather").getAsBoolean()) {
+            mainOverworld.setStorm(false);
+            mainOverworld.setThundering(false);
+        }
+        if (combinedSleep != null) {
+            combinedSleep.wakeSleepers();
+        }
+        getLogger().info("Applied Fabric sleep skip, fullTime=" + fullTime);
+    }
+
+    private void startIncomingTask() {
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                store.consumeIncoming("in-survival", SkyWorlds.this::handleIncoming);
+            }
+        }.runTaskTimer(this, 5L, 2L);
+    }
+
+    private void handleIncoming(JsonObject o) {
+        String kind = o.has("kind") ? o.get("kind").getAsString() : "player";
+        try {
+            switch (kind) {
+                case "pearl" -> spawnIncomingPearl(o);
+                case "entity" -> spawnIncomingEntity(o);
+                default -> {
+                    // player payload is applied on join
                 }
             }
-        }.runTaskTimer(this, 0L, 20L);
+        } catch (Exception e) {
+            getLogger().log(Level.WARNING, "incoming handoff", e);
+        }
+    }
+
+    private void spawnIncomingPearl(JsonObject o) {
+        World w = worldForDim(o.has("dim") ? o.get("dim").getAsString() : "overworld");
+        if (w == null) return;
+        double requestedY = o.get("y").getAsDouble();
+        double y = findPearlFallY(w, o.get("x").getAsDouble(), requestedY, o.get("z").getAsDouble());
+        Location loc = new Location(w, o.get("x").getAsDouble(), y, o.get("z").getAsDouble());
+        w.getChunkAt(loc);
+        Vector vel = new Vector(o.get("vx").getAsDouble(), o.get("vy").getAsDouble(), o.get("vz").getAsDouble());
+        UUID owner = UUID.fromString(o.get("owner").getAsString());
+        EnderPearl pearl = w.spawn(loc, EnderPearl.class, p -> {
+            p.getPersistentDataContainer().set(pearlTag, PersistentDataType.BYTE, (byte) 1);
+            p.setVelocity(vel);
+            Player shooter = getServer().getPlayer(owner);
+            if (shooter != null) {
+                p.setShooter(shooter);
+            }
+        });
+        pearl.getPersistentDataContainer().set(new NamespacedKey(this, "owner"),
+                PersistentDataType.STRING, owner.toString());
+        getLogger().info("Incoming pearl owner=" + owner
+                + " at " + loc.getBlockX() + "," + loc.getBlockY() + "," + loc.getBlockZ()
+                + " (from y=" + (int) requestedY + ") vy=" + vel.getY());
+    }
+
+    /** Drop through seam-height solids so a throw from ~1310 falls instead of dying on the gate floor. */
+    private double findPearlFallY(World w, double x, double startY, double z) {
+        double y = Math.min(startY, thresholdY - 0.25);
+        double maxAccept = thresholdY - 20.0;
+        int minY = w.getMinHeight() + 2;
+        Double firstOpen = null;
+        for (int i = 0; i < 2000 && y > minY; i++) {
+            Location loc = new Location(w, x, y, z);
+            w.getChunkAt(loc);
+            if (isPearlAir(loc) && isPearlAir(loc.clone().add(0, -1, 0)) && isPearlAir(loc.clone().add(0, -2, 0))) {
+                if (firstOpen == null) {
+                    firstOpen = y;
+                }
+                if (y <= maxAccept) {
+                    return y;
+                }
+            }
+            y -= 0.5;
+        }
+        return firstOpen != null ? Math.min(firstOpen, maxAccept) : y;
+    }
+
+    private static boolean isPearlAir(Location loc) {
+        return loc.getBlock().isEmpty();
+    }
+
+    private void spawnIncomingEntity(JsonObject o) {
+        if (!o.has("snbt")) return;
+        World w = worldForDim(o.has("dim") ? o.get("dim").getAsString() : "overworld");
+        if (w == null) return;
+        Location loc = new Location(w, o.get("x").getAsDouble(), o.get("y").getAsDouble(), o.get("z").getAsDouble());
+        spawnFromSnbt(o.get("snbt").getAsString(), loc);
+    }
+
+    private Entity spawnFromSnbt(String snbt, Location loc) {
+        try {
+            Class<?> tagParser = Class.forName("net.minecraft.nbt.TagParser");
+            Object tag = tagParser.getMethod("parseCompoundFully", String.class).invoke(null, snbt);
+            Class<?> snapCl = Class.forName("org.bukkit.craftbukkit.entity.CraftEntitySnapshot");
+            for (Class<?> param : new Class<?>[] {
+                    Class.forName("net.minecraft.nbt.CompoundTag")
+            }) {
+                try {
+                    Object snap = snapCl.getMethod("create", param).invoke(null, tag);
+                    if (snap instanceof org.bukkit.entity.EntitySnapshot es) {
+                        return es.createEntity(loc);
+                    }
+                } catch (NoSuchMethodException ignored) {
+                }
+            }
+        } catch (Exception e) {
+            getLogger().fine("entity spawn: " + e.getMessage());
+        }
+        return null;
+    }
+
+    private World worldForDim(String dim) {
+        if (dim == null) return mainOverworld;
+        return switch (dim) {
+            case "nether" -> mainNether != null ? mainNether : mainOverworld;
+            case "end" -> theEnd != null ? theEnd : mainOverworld;
+            default -> mainOverworld;
+        };
+    }
+
+    private String dimOf(World world) {
+        if (world == null) return "overworld";
+        if (world.getEnvironment() == World.Environment.NETHER) return "nether";
+        if (world.getEnvironment() == World.Environment.THE_END) return "end";
+        return "overworld";
     }
 
     private void startDimensionTransitionTask() {
         new BukkitRunnable() {
             @Override
             public void run() {
-                try {
-                    switchCooldowns.replaceAll((id, ticks) -> ticks - 1);
-                    switchCooldowns.entrySet().removeIf(entry -> entry.getValue() <= 0);
-
-                    List<World> worlds = new ArrayList<>();
-                    if (mainOverworld != null) worlds.add(mainOverworld);
-                    if (mirrorOverworld != null) worlds.add(mirrorOverworld);
-                    if (mainNether != null) worlds.add(mainNether);
-                    if (mirrorNether != null) worlds.add(mirrorNether);
-
-                    for (World world : worlds) {
-                        processEntitiesInWorld(world);
-                    }
-                } catch (Exception e) {
-                    getLogger().log(Level.WARNING, "Error in dimension transition task", e);
+                switchCooldowns.replaceAll((id, ticks) -> ticks - 1);
+                switchCooldowns.entrySet().removeIf(e -> e.getValue() <= 0);
+                if (mainOverworld != null) processEntitiesInWorld(mainOverworld);
+                if (mainNether != null) processEntitiesInWorld(mainNether);
+                if (combinedSleep != null && mainOverworld != null) {
+                    combinedSleep.tick(mainOverworld);
                 }
             }
         }.runTaskTimer(this, 0L, 1L);
+    }
+
+    private void unloadLegacyMirrors() {
+        for (String name : List.of("mirror_overworld", "mirror_nether")) {
+            World w = getServer().getWorld(name);
+            if (w != null) {
+                boolean ok = getServer().unloadWorld(w, true);
+                getLogger().info("Unloaded leftover " + name + ": " + ok);
+            }
+        }
     }
 
     private void processEntitiesInWorld(World world) {
         try {
             for (Entity entity : world.getEntities()) {
                 UUID id = entity.getUniqueId();
-                
-                if (switchCooldowns.containsKey(id)) {
-                    continue;
-                }
-                
+                if (switchCooldowns.containsKey(id)) continue;
+                if (travelsWithPlayer(entity)) continue;
                 Location loc = entity.getLocation();
-                if (loc == null) continue;
-                
                 if (loc.getY() > thresholdY) {
                     handleEntityAboveThreshold(entity, id);
                 } else {
@@ -325,423 +363,414 @@ public class SkyWorlds extends JavaPlugin implements Listener {
                 }
             }
         } catch (Exception e) {
-            getLogger().log(Level.WARNING, "Error processing entities in " + world.getName(), e);
+            getLogger().log(Level.WARNING, "scan " + world.getName(), e);
         }
+    }
+
+    private static boolean travelsWithPlayer(Entity entity) {
+        if (entity instanceof Player) return false;
+        if (entity instanceof EnderPearl) return false;
+        for (Entity p : entity.getPassengers()) {
+            if (p instanceof Player) return true;
+        }
+        Entity vehicle = entity.getVehicle();
+        if (vehicle instanceof Player) return true;
+        if (entity instanceof org.bukkit.entity.LivingEntity living && living.isLeashed()) {
+            try {
+                return living.getLeashHolder() instanceof Player;
+            } catch (Exception ignored) {
+            }
+        }
+        return false;
     }
 
     private void handleEntityAboveThreshold(Entity entity, UUID id) {
-        int ticks = ticksAboveThreshold.getOrDefault(id, 0);
-        
-        if (ticks < 0) {
+        if (entity instanceof EnderPearl pearl) {
+            if (isTransferred(pearl)) return;
+            // Parked stasis must stay on this side. Only flying pearls cross Y 1320.
+            if (pearl.getVelocity().lengthSquared() < 0.01) {
+                return;
+            }
+            gatePearl(pearl);
             return;
         }
-        
+        int ticks = ticksAboveThreshold.getOrDefault(id, 0);
+        if (ticks < 0) return;
         ticks++;
         ticksAboveThreshold.put(id, ticks);
-        
-        if (ticks >= transitionTicks) {
-            if (entity instanceof Player) {
-                Player player = (Player) entity;
-                
-                if (player.getInventory().getItemInMainHand().getType() == Material.DRAGON_BREATH ||
-                    player.getInventory().getItemInOffHand().getType() == Material.DRAGON_BREATH) {
-                    
-                    switchWorld(entity);
-                    ticksAboveThreshold.remove(id);
-                    switchCooldowns.put(id, cooldownTicks);
-                    
-                } else {
-                    if (ticks == transitionTicks) {
-                        player.sendMessage(ChatColor.RED + "You need Dragon's Breath in your hand to enter the mirror dimension!");
-                    }
-                    ticksAboveThreshold.put(id, -1);
-                }
-            } else {
-                switchWorld(entity);
+        if (ticks < transitionTicks) return;
+
+        if (entity instanceof Player player) {
+            if (hasBreath(player)) {
+                gatePlayer(player);
                 ticksAboveThreshold.remove(id);
                 switchCooldowns.put(id, cooldownTicks);
+            } else if (ticks == transitionTicks) {
+                player.sendMessage(ChatColor.RED + "You need Dragon's Breath in your hand to enter the sky world!");
+                ticksAboveThreshold.put(id, -1);
             }
+        } else {
+            gateLooseEntity(entity);
+            ticksAboveThreshold.remove(id);
+            switchCooldowns.put(id, cooldownTicks);
         }
     }
 
-    private void switchWorld(Entity entity) {
-        Location fromLoc = entity.getLocation();
-        World fromWorld = fromLoc.getWorld();
-        if (fromWorld == null) return;
+    private boolean hasBreath(Player player) {
+        return player.getInventory().getItemInMainHand().getType() == Material.DRAGON_BREATH
+                || player.getInventory().getItemInOffHand().getType() == Material.DRAGON_BREATH;
+    }
 
-        World toWorld;
-        if (fromWorld.equals(mainOverworld)) {
-            toWorld = mirrorOverworld;
-        } else if (fromWorld.equals(mirrorOverworld)) {
-            toWorld = mainOverworld;
-        } else if (fromWorld.equals(mainNether)) {
-            toWorld = mirrorNether;
-        } else if (fromWorld.equals(mirrorNether)) {
-            toWorld = mainNether;
-        } else {
+    private boolean isTransferred(Entity entity) {
+        Byte v = entity.getPersistentDataContainer().get(pearlTag, PersistentDataType.BYTE);
+        return v != null && v == 1;
+    }
+
+    private Location mirrored(Location from) {
+        double y = (2.0 * pivotY) - from.getY();
+        Location to = from.clone();
+        to.setY(y);
+        return to;
+    }
+
+    private void gatePlayer(Player player) {
+        Location dest = mirrored(player.getLocation());
+        List<String> extras = HandoffStore.takeMountsAndLeashes(player);
+        String dim = dimOf(player.getWorld());
+        player.addPotionEffect(new PotionEffect(PotionEffectType.BLINDNESS, fadeTicks, 1, false, false));
+        player.playSound(player.getLocation(), "minecraft:block.portal.travel", 1.0f, 1.0f);
+        store.writePlayerToFabric(player, dest, dim, extras);
+        requestProxyConnect(player, "fabric");
+        getLogger().info("Gated " + player.getName() + " to Fabric");
+    }
+
+    private void gatePearl(EnderPearl pearl) {
+        ProjectileSource src = pearl.getShooter();
+        UUID owner = src instanceof Player p ? p.getUniqueId() : pearl.getUniqueId();
+        Location dest = mirrored(pearl.getLocation());
+        dest.setY(Math.min(dest.getY(), thresholdY - 2.0));
+        Vector vel = pearl.getVelocity().clone();
+        vel.setY(-vel.getY());
+        store.writePearl("in-fabric", owner, dest, vel, dimOf(pearl.getWorld()));
+        pearl.remove();
+        if (src instanceof Player shooter && shooter.isOnline()) {
+            shooter.playSound(shooter.getLocation(), "minecraft:block.portal.travel", 0.4f, 1.2f);
+        }
+        getLogger().info("Pearl -> fabric owner=" + owner
+                + " at " + dest.getBlockX() + "," + dest.getBlockY() + "," + dest.getBlockZ()
+                + " vy=" + vel.getY());
+    }
+
+    private void gateLooseEntity(Entity entity) {
+        if (entity instanceof Player) return;
+        String snbt = HandoffStore.snapshot(entity);
+        if (snbt == null) return;
+        Location dest = mirrored(entity.getLocation());
+        store.writeEntity("in-fabric", snbt, dest, dimOf(entity.getWorld()));
+        entity.remove();
+    }
+
+    @EventHandler
+    public void onJoin(PlayerJoinEvent event) {
+        Player player = event.getPlayer();
+        JsonObject pending = store.takePlayer(player.getUniqueId(), "in-survival");
+        if (pending != null) {
+            getServer().getScheduler().runTask(this, () -> {
+                applyPlayerHandoff(player, pending);
+                unstickPlayer(player);
+            });
+            getServer().getScheduler().runTaskLater(this, () -> unstickPlayer(player), 40L);
+            if (stasisKeepalive != null) {
+                stasisKeepalive.onJoin(player);
+            }
             return;
         }
-
-        if (toWorld == null) return;
-
-        double mirroredY = (2 * pivotY) - fromLoc.getY();
-        Location toLoc = new Location(
-            toWorld,
-            fromLoc.getX(),
-            mirroredY,
-            fromLoc.getZ(),
-            fromLoc.getYaw(),
-            fromLoc.getPitch()
-        );
-
-        clampToBorder(toLoc, toWorld);
-
-        if (entity instanceof Player) {
-            Player player = (Player) entity;
-            player.addPotionEffect(new PotionEffect(PotionEffectType.BLINDNESS, fadeTicks, 1, false, false));
-            player.playSound(toLoc, "minecraft:block.portal.travel", 1.0f, 1.0f);
+        getServer().getScheduler().runTaskLater(this, () -> unstickPlayer(player), 40L);
+        if (stasisKeepalive != null) {
+            stasisKeepalive.onJoin(player);
         }
-
-        entity.teleport(toLoc);
-        getLogger().fine("Switched " + entity.getType() + " from " + fromWorld.getName() + " to " + toWorld.getName());
+        if (LegacyMirrorResume.isLegacyMirrorWorld(player.getWorld())) {
+            getLogger().info("Join in leftover " + player.getWorld().getName()
+                    + " — sending " + player.getName() + " to Fabric");
+            getServer().getScheduler().runTask(this, () -> {
+                LegacyMirrorResume.resumeOnline(player, store, redis);
+                sendBungeeConnect(player, "fabric");
+            });
+            return;
+        }
+        if (store.peekPlayer(player.getUniqueId(), "in-fabric") != null || redis.hasMigrate(player.getUniqueId())) {
+            getServer().getScheduler().runTask(this, () -> requestProxyConnect(player, "fabric"));
+        }
     }
 
-    @EventHandler
-    public void onPlayerPortal(PlayerPortalEvent event) {
+    private void applyPlayerHandoff(Player player, JsonObject o) {
+        World w = worldForDim(o.has("dim") ? o.get("dim").getAsString() : "overworld");
+        double y = Math.min(o.get("y").getAsDouble(), thresholdY - 2.0);
+        Location loc = new Location(w,
+                o.get("x").getAsDouble(), y, o.get("z").getAsDouble(),
+                o.has("yaw") ? o.get("yaw").getAsFloat() : player.getLocation().getYaw(),
+                o.has("pitch") ? o.get("pitch").getAsFloat() : player.getLocation().getPitch());
+        player.teleport(loc);
+        if (o.has("stasis") && o.get("stasis").getAsBoolean() && stasisKeepalive != null) {
+            stasisKeepalive.consumeNear(player, loc);
+        }
+        if (o.has("vx")) {
+            player.setVelocity(new Vector(o.get("vx").getAsDouble(), o.get("vy").getAsDouble(), o.get("vz").getAsDouble()));
+        }
+        if (o.has("gliding") && o.get("gliding").getAsBoolean()) {
+            player.setGliding(true);
+        }
+        spawnExtras(player, o);
+        switchCooldowns.put(player.getUniqueId(), cooldownTicks);
+        unstickPlayer(player);
+    }
+
+    private void unstickPlayer(Player player) {
+        if (player == null || !player.isOnline()) {
+            return;
+        }
         try {
-            if (event.getCause() != TeleportCause.NETHER_PORTAL) {
-                return;
+            if (player.isSleeping()) {
+                player.wakeup(true);
             }
-            
-            if (mainNether == null || mirrorNether == null) {
-                return;
+        } catch (Exception ignored) {
+        }
+        try {
+            if (player.getGameMode() == org.bukkit.GameMode.SPECTATOR) {
+                player.setGameMode(org.bukkit.GameMode.SURVIVAL);
             }
-
-            Location fromLoc = event.getFrom();
-            World fromWorld = fromLoc.getWorld();
-            if (fromWorld == null) return;
-
-            boolean isMirrorWorld = fromWorld.equals(mirrorOverworld) || 
-                                   fromWorld.equals(mirrorNether);
-            
-            if (!isMirrorWorld) {
-                return;
+            player.setAllowFlight(false);
+            player.setFlying(false);
+            if (player.getWalkSpeed() <= 0.0f) {
+                player.setWalkSpeed(0.2f);
             }
+        } catch (Exception ignored) {
+        }
+    }
 
-            World toWorld;
-            double scale;
-
-            if (fromWorld.getEnvironment() == World.Environment.NORMAL) {
-                toWorld = mirrorNether;
-                scale = 1.0 / netherScale;
-            } else if (fromWorld.getEnvironment() == World.Environment.NETHER) {
-                toWorld = mirrorOverworld;
-                scale = netherScale;
+    private void spawnExtras(Player player, JsonObject o) {
+        if (!o.has("entities") || !o.get("entities").isJsonArray()) return;
+        JsonArray arr = o.getAsJsonArray("entities");
+        Location loc = player.getLocation();
+        for (var el : arr) {
+            Entity spawned = spawnFromSnbt(el.getAsString(), loc);
+            if (spawned == null) continue;
+            if (spawned instanceof org.bukkit.entity.LivingEntity living) {
+                try {
+                    living.setLeashHolder(player);
+                } catch (Exception ignored) {
+                }
             } else {
-                return;
+                spawned.addPassenger(player);
             }
-
-            if (toWorld == null) return;
-
-            Location calcLoc = new Location(
-                toWorld,
-                fromLoc.getX() * scale,
-                fromLoc.getY(),
-                fromLoc.getZ() * scale
-            );
-            clampToBorder(calcLoc, toWorld);
-
-            Location targetLoc = findPortal(calcLoc, portalSearchRadius);
-            if (targetLoc == null) {
-                targetLoc = createNetherPortal(calcLoc);
-            }
-
-            if (targetLoc != null) {
-                event.setCancelled(true);
-                event.getPlayer().teleport(targetLoc);
-                getLogger().fine("Mirror world portal: " + fromWorld.getName() + " -> " + toWorld.getName());
-            } else {
-                getLogger().warning("Failed to create mirror portal for " + event.getPlayer().getName());
-            }
-
-        } catch (Exception e) {
-            getLogger().log(Level.WARNING, "Error in PlayerPortalEvent", e);
         }
     }
 
     @EventHandler
-    public void onEntityPortal(EntityPortalEvent event) {
-        try {
-            if (event.getEntity() instanceof Player) return;
-
-            Location fromLoc = event.getFrom();
-            if (fromLoc == null) return;
-
-            Block portalBlock = fromLoc.getBlock();
-            if (portalBlock.getType() != Material.NETHER_PORTAL) return;
-            
-            if (mainNether == null || mirrorNether == null) return;
-
-            World fromWorld = fromLoc.getWorld();
-            if (fromWorld == null) return;
-
-            boolean isMirrorWorld = fromWorld.equals(mirrorOverworld) || 
-                                   fromWorld.equals(mirrorNether);
-            
-            if (!isMirrorWorld) {
-                return;
-            }
-
-            World toWorld;
-            double scale;
-
-            if (fromWorld.getEnvironment() == World.Environment.NORMAL) {
-                toWorld = mirrorNether;
-                scale = 1.0 / netherScale;
-            } else if (fromWorld.getEnvironment() == World.Environment.NETHER) {
-                toWorld = mirrorOverworld;
-                scale = netherScale;
-            } else {
-                return;
-            }
-
-            if (toWorld == null) return;
-
-            Location calcLoc = new Location(
-                toWorld,
-                fromLoc.getX() * scale,
-                fromLoc.getY(),
-                fromLoc.getZ() * scale
-            );
-            clampToBorder(calcLoc, toWorld);
-
-            Location targetLoc = findPortal(calcLoc, portalSearchRadius);
-            if (targetLoc == null) {
-                targetLoc = createNetherPortal(calcLoc);
-            }
-
-            if (targetLoc != null) {
-                event.setCancelled(true);
-                event.getEntity().teleport(targetLoc);
-                getLogger().fine("Mirror world entity portal: " + fromWorld.getName() + " -> " + toWorld.getName());
-            }
-
-        } catch (Exception e) {
-            getLogger().log(Level.WARNING, "Error in EntityPortalEvent", e);
+    public void onQuit(PlayerQuitEvent event) {
+        ticksAboveThreshold.remove(event.getPlayer().getUniqueId());
+        if (stasisKeepalive != null) {
+            stasisKeepalive.onQuit(event.getPlayer());
         }
     }
 
-    private Location findPortal(Location center, int radius) {
-        World world = center.getWorld();
-        if (world == null) return null;
-        
-        int cx = center.getBlockX();
-        int cy = center.getBlockY();
-        int cz = center.getBlockZ();
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onBed(PlayerBedEnterEvent event) {
+        if (event.getBedEnterResult() != PlayerBedEnterEvent.BedEnterResult.OK) {
+            return;
+        }
+        Location bed = event.getBed().getLocation();
+        store.writeBed(event.getPlayer().getUniqueId(), "survival", dimOf(event.getPlayer().getWorld()), bed);
+        JsonObject o = new JsonObject();
+        o.addProperty("server", "survival");
+        o.addProperty("world", dimOf(event.getPlayer().getWorld()));
+        o.addProperty("x", bed.getX());
+        o.addProperty("y", bed.getY());
+        o.addProperty("z", bed.getZ());
+        redis.setBed(event.getPlayer().getUniqueId(), o.toString(), 60 * 60 * 24 * 30);
+    }
 
-        Location closest = null;
-        double minDist = Double.MAX_VALUE;
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onRespawn(PlayerRespawnEvent event) {
+        JsonObject bed = resolveBed(event.getPlayer().getUniqueId());
+        if (bed == null) {
+            return;
+        }
+        if (isFabricBed(bed)) {
+            sendToFabricBed(event.getPlayer(), bed);
+            return;
+        }
+        Location dest = survivalBedLocation(bed);
+        if (dest != null) {
+            event.setRespawnLocation(dest);
+        }
+    }
 
-        int centerChunkX = cx >> 4;
-        int centerChunkZ = cz >> 4;
-        int chunkRadius = (radius / 16) + 1;
-        
-        for (int chunkX = centerChunkX - 1; chunkX <= centerChunkX + 1; chunkX++) {
-            for (int chunkZ = centerChunkZ - 1; chunkZ <= centerChunkZ + 1; chunkZ++) {
-                if (!world.isChunkLoaded(chunkX, chunkZ)) {
-                    try {
-                        world.getChunkAt(chunkX, chunkZ);
-                    } catch (Exception e) {
-                        continue;
-                    }
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onPortal(PlayerPortalEvent event) {
+        if (event.getCause() != TeleportCause.END_PORTAL) {
+            return;
+        }
+        World from = event.getFrom().getWorld();
+        if (from == null || from.getEnvironment() != World.Environment.THE_END) {
+            // Entering the End from ground overworld/nether stays vanilla.
+            return;
+        }
+        JsonObject bed = resolveBed(event.getPlayer().getUniqueId());
+        if (bed == null) {
+            return;
+        }
+        if (isFabricBed(bed)) {
+            event.setCancelled(true);
+            sendToFabricBed(event.getPlayer(), bed);
+            return;
+        }
+        Location dest = survivalBedLocation(bed);
+        if (dest != null) {
+            event.setTo(dest);
+        }
+    }
+
+    private JsonObject resolveBed(UUID uuid) {
+        JsonObject bed = store.readBed(uuid);
+        if (bed != null) {
+            return bed;
+        }
+        String raw = redis.getBed(uuid);
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return JsonParser.parseString(raw).getAsJsonObject();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static boolean isFabricBed(JsonObject bed) {
+        String server = bed.has("server") ? bed.get("server").getAsString() : "survival";
+        return "fabric".equalsIgnoreCase(server);
+    }
+
+    private Location survivalBedLocation(JsonObject bed) {
+        if (!bed.has("x") || !bed.has("y") || !bed.has("z")) {
+            return null;
+        }
+        World w = worldForDim(bed.has("world") ? bed.get("world").getAsString() : "overworld");
+        if (w == null) {
+            return null;
+        }
+        float yaw = bed.has("yaw") ? bed.get("yaw").getAsFloat() : 0f;
+        float pitch = bed.has("pitch") ? bed.get("pitch").getAsFloat() : 0f;
+        return new Location(w,
+                bed.get("x").getAsDouble() + 0.5,
+                bed.get("y").getAsDouble() + 0.5,
+                bed.get("z").getAsDouble() + 0.5,
+                yaw, pitch);
+    }
+
+    private void sendToFabricBed(Player player, JsonObject bed) {
+        UUID uuid = player.getUniqueId();
+        String dim = bed.has("world") ? bed.get("world").getAsString() : "overworld";
+        Location dest = new Location(mainOverworld,
+                bed.get("x").getAsDouble() + 0.5,
+                bed.get("y").getAsDouble() + 0.5,
+                bed.get("z").getAsDouble() + 0.5,
+                bed.has("yaw") ? bed.get("yaw").getAsFloat() : player.getLocation().getYaw(),
+                bed.has("pitch") ? bed.get("pitch").getAsFloat() : player.getLocation().getPitch());
+        store.writePlayerToFabric(player, dest, dim, List.of());
+        requestProxyConnect(player, "fabric");
+        getLogger().info("Shared bed: " + player.getName() + " -> fabric");
+        getServer().getScheduler().runTaskLater(this, () -> {
+            if (!player.isOnline()) {
+                return;
+            }
+            if (player.getWorld() != null && player.getWorld().getEnvironment() == World.Environment.THE_END) {
+                getLogger().warning("Shared bed transfer stalled for " + player.getName() + "; leaving End locally");
+                Location fallback = survivalBedLocation(resolveBed(uuid));
+                if (fallback == null && mainOverworld != null) {
+                    fallback = mainOverworld.getSpawnLocation();
+                }
+                if (fallback != null) {
+                    player.teleport(fallback);
                 }
             }
-        }
+        }, 60L);
+    }
 
-        Set<Chunk> chunksToSearch = new HashSet<>();
-        for (int chunkX = centerChunkX - chunkRadius; chunkX <= centerChunkX + chunkRadius; chunkX++) {
-            for (int chunkZ = centerChunkZ - chunkRadius; chunkZ <= centerChunkZ + chunkRadius; chunkZ++) {
-                if (world.isChunkLoaded(chunkX, chunkZ)) {
-                    chunksToSearch.add(world.getChunkAt(chunkX, chunkZ));
-                }
-            }
+    /** Redis pub/sub plus BungeeCord Connect so a dead Velocity subscriber cannot eat the gate. */
+    private void requestProxyConnect(Player player, String dest) {
+        if (player == null || dest == null || dest.isBlank()) {
+            return;
         }
+        redis.allow(player.getUniqueId(), dest, 120);
+        if ("fabric".equalsIgnoreCase(dest)) {
+            redis.markMigrate(player.getUniqueId());
+        }
+        redis.publishConnect(player.getUniqueId(), dest);
+        sendBungeeConnect(player, dest);
+        getServer().getScheduler().runTask(this, () -> sendBungeeConnect(player, dest));
+    }
 
-        List<int[]> searchOffsets = generateSpiralSearch(radius);
-        
-        for (int[] offset : searchOffsets) {
-            int bx = cx + offset[0];
-            int by = cy + offset[1];
-            int bz = cz + offset[2];
-            
-            Chunk blockChunk = world.getChunkAt(bx >> 4, bz >> 4);
-            if (!chunksToSearch.contains(blockChunk)) {
-                continue;
+    private void sendBungeeConnect(Player player, String dest) {
+        if (player == null || !player.isOnline()) {
+            return;
+        }
+        try {
+            ByteArrayDataOutput out = ByteStreams.newDataOutput();
+            out.writeUTF("Connect");
+            out.writeUTF(dest);
+            player.sendPluginMessage(this, "BungeeCord", out.toByteArray());
+        } catch (Exception e) {
+            getLogger().warning("Bungee Connect failed: " + e.getMessage());
+        }
+    }
+
+    @EventHandler
+    public void onPearlLaunch(ProjectileLaunchEvent event) {
+        if (!(event.getEntity() instanceof EnderPearl)) return;
+        // Gating happens on tick when Y exceeds threshold.
+    }
+
+    @EventHandler
+    public void onPearlHit(ProjectileHitEvent event) {
+        if (!(event.getEntity() instanceof EnderPearl pearl)) return;
+        if (!isTransferred(pearl)) {
+            if (stasisKeepalive != null) {
+                stasisKeepalive.onHit(pearl);
             }
-            
+            return;
+        }
+        String ownerStr = pearl.getPersistentDataContainer().get(new NamespacedKey(this, "owner"), PersistentDataType.STRING);
+        if (ownerStr == null) return;
+        UUID owner = UUID.fromString(ownerStr);
+        Player p = getServer().getPlayer(owner);
+        Location hit = pearl.getLocation().clone();
+        if (hit.getY() > thresholdY - 2.0) {
+            hit.setY(thresholdY - 2.0);
+        }
+        if (p != null && p.isOnline()) {
+            getLogger().info("Incoming pearl hit owner=" + owner
+                    + " at " + hit.getBlockX() + "," + hit.getBlockY() + "," + hit.getBlockZ()
+                    + " pull=local");
+            p.teleport(hit);
+            return;
+        }
+        // Pearls still cross the gate as entities. Do not Velocity-switch the
+        // owner: that kidnapped players whose pearl crossed Y 1320 far away.
+        getLogger().info("Incoming pearl hit owner=" + owner
+                + " at " + hit.getBlockX() + "," + hit.getBlockY() + "," + hit.getBlockZ()
+                + " pull=none (owner not on survival)");
+    }
+
+    private void clearPersonalClocks() {
+        for (Player player : getServer().getOnlinePlayers()) {
             try {
-                if (world.getBlockAt(bx, by, bz).getType() == Material.NETHER_PORTAL) {
-                    Location candidate = new Location(world, bx, by, bz);
-                    double dist = center.distanceSquared(candidate);
-                    
-                    if (dist < minDist) {
-                        minDist = dist;
-                        closest = candidate;
-                        
-                        if (dist < 25) break;
-                    }
-                }
-            } catch (Exception e) {
-                continue;
+                if (!player.isPlayerTimeRelative()) player.resetPlayerTime();
+                player.resetPlayerWeather();
+                if (player.getWalkSpeed() <= 0.0f) player.setWalkSpeed(0.2f);
+            } catch (Exception ignored) {
             }
         }
-
-        if (closest != null) {
-            int by = closest.getBlockY();
-            while (by > world.getMinHeight() && 
-                   world.isChunkLoaded(closest.getBlockX() >> 4, closest.getBlockZ() >> 4) &&
-                   world.getBlockAt(closest.getBlockX(), by - 1, closest.getBlockZ()).getType() == Material.NETHER_PORTAL) {
-                by--;
-            }
-            
-            closest.setY(by + 1);
-            closest.setX(closest.getBlockX() + 0.5);
-            closest.setZ(closest.getBlockZ() + 0.5);
-            
-            getLogger().fine("Found existing portal at " + closest.getBlockX() + "," + by + "," + closest.getBlockZ());
-            return closest;
-        }
-        
-        return null;
-    }
-
-    private List<int[]> generateSpiralSearch(int radius) {
-        List<int[]> offsets = new ArrayList<>();
-        
-        offsets.add(new int[]{0, 0, 0});
-        
-        for (int r = 1; r <= radius; r++) {
-            for (int dy = -r; dy <= r; dy++) {
-                for (int dx = -r; dx <= r; dx++) {
-                    for (int dz = -r; dz <= r; dz++) {
-                        if (Math.max(Math.max(Math.abs(dx), Math.abs(dy)), Math.abs(dz)) == r) {
-                            offsets.add(new int[]{dx, dy, dz});
-                        }
-                    }
-                }
-            }
-        }
-        
-        return offsets;
-    }
-
-    private Location createNetherPortal(Location center) {
-        World world = center.getWorld();
-        if (world == null) return null;
-        
-        int x = center.getBlockX() - 1;
-        int y = findSafePortalY(center);
-        int z = center.getBlockZ();
-
-        if (y == -1) {
-            getLogger().warning("Could not find safe Y for portal at " + center);
-            return null;
-        }
-
-        try {
-            for (int dx = 0; dx < 4; dx++) {
-                for (int dy = 0; dy < 5; dy++) {
-                    world.getBlockAt(x + dx, y + dy, z).setType(Material.AIR);
-                }
-            }
-
-            for (int dx = 0; dx < 4; dx++) {
-                world.getBlockAt(x + dx, y, z).setType(Material.OBSIDIAN);
-                world.getBlockAt(x + dx, y + 4, z).setType(Material.OBSIDIAN);
-            }
-            for (int dy = 1; dy < 4; dy++) {
-                world.getBlockAt(x, y + dy, z).setType(Material.OBSIDIAN);
-                world.getBlockAt(x + 3, y + dy, z).setType(Material.OBSIDIAN);
-            }
-
-            for (int dx = 1; dx < 3; dx++) {
-                for (int dy = 1; dy < 4; dy++) {
-                    Block block = world.getBlockAt(x + dx, y + dy, z);
-                    block.setType(Material.NETHER_PORTAL);
-                    
-                    Orientable portalData = (Orientable) block.getBlockData();
-                    portalData.setAxis(Axis.X);
-                    block.setBlockData(portalData);
-                }
-            }
-
-            getLogger().info("Created new portal at " + x + "," + y + "," + z + " in " + world.getName());
-            
-            return new Location(world, x + 1.5, y + 1, z + 0.5, 0, 0);
-            
-        } catch (Exception e) {
-            getLogger().log(Level.WARNING, "Error creating portal", e);
-            return null;
-        }
-    }
-
-    private int findSafePortalY(Location center) {
-        World world = center.getWorld();
-        if (world == null) return -1;
-        
-        int maxY = world.getMaxHeight() - 5;
-        int minY = world.getMinHeight() + 1;
-        int originalY = (int) center.getY();
-
-        int searchStartY = Math.min(originalY, maxY);
-        int searchEndY = Math.max(minY, originalY - 64);
-
-        for (int testY = searchStartY; testY >= searchEndY; testY--) {
-            Location testLoc = new Location(world, center.getX(), testY - 1, center.getZ());
-            
-            if (!world.isChunkLoaded(testLoc.getBlockX() >> 4, testLoc.getBlockZ() >> 4)) {
-                continue;
-            }
-            
-            Location portalLoc = center.clone();
-            portalLoc.setY(testY);
-            
-            if (testLoc.getBlock().getType().isSolid() && isAreaClearForPortal(portalLoc)) {
-                return testY;
-            }
-        }
-        
-        return Math.max(minY, Math.min(originalY, maxY));
-    }
-
-    private boolean isAreaClearForPortal(Location bottomLeft) {
-        World world = bottomLeft.getWorld();
-        if (world == null) return false;
-        
-        int x = bottomLeft.getBlockX() - 1;
-        int y = bottomLeft.getBlockY();
-        int z = bottomLeft.getBlockZ();
-
-        if (!world.isChunkLoaded(x >> 4, z >> 4)) {
-            return false;
-        }
-
-        for (int dx = 0; dx < 4; dx++) {
-            for (int dy = 0; dy < 5; dy++) {
-                if (!world.getBlockAt(x + dx, y + dy, z).getType().isAir()) {
-                    return false;
-                }
-            }
-        }
-        
-        return true;
-    }
-
-    @Override
-    public void onDisable() {
-        getLogger().info("SkyWorlds v2.1.1 disabled.");
-        
-        ticksAboveThreshold.clear();
-        switchCooldowns.clear();
     }
 }
