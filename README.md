@@ -1,3 +1,8 @@
+<!-- azpbmd-live -->
+**Live:** survival, fabric, velocity
+
+Survival is running 3.0.18 from this project. Fabric and velocity load their own jars from here. [SkyWorlds-Paper](https://github.com/wilderop/SkyWorlds-Paper) is the older 2.2 line and is not what survival runs.
+<!-- /azpbmd-live -->
 # SkyWorlds (Paper only + optional Fabric test gate)
 
 Production plugin for **A Zombie Pigman Broke My Door**.
